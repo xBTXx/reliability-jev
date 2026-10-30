@@ -30,6 +30,7 @@ def test_both_models_receive_observed_field_identity_and_context(monkeypatch):
                              "label": "City", "value": "Milan", "context": {"name": "Departure", "form": 7}})
     post = Mock(side_effect=lambda url, key, body: {
         "model": "test", "answers": {
+            "review_gate": choice(["CONTINUE", "REVIEW"], "CONTINUE"),
             "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
             "type_text_target": choice(body["questions"]["type_text_target"]["criteria"], "1"),
         },
@@ -128,8 +129,8 @@ def test_same_value_is_not_executed_and_reassessment_is_bounded(runner, monkeypa
     monkeypatch.setattr(loop, "field_text", Mock(return_value=("Berlin", {"model": "test", "latency_ms": 10})))
     for _ in range(3):
         act(runner)
-    assert runner.state["status"] == "blocked"
-    assert runner.state["stop_reason"]["code"] == "same_value"
+    assert runner.state["status"] == "ready"
+    assert runner.state["review_pending"] == "recovery_exhausted"
     assert runner.state["history"] == []
     assert len(runner.state["text_calls"]) == 3
     runner.state["browser"].act.assert_not_called()
@@ -194,20 +195,23 @@ def test_post_action_observation_failure_stops_tick_without_replaying(runner, mo
     runner.state["browser"].act.assert_called_once()
 
 
-def test_done_cannot_override_unresolved_form_effect(runner):
+def test_done_with_unresolved_effect_requires_supervision(runner, monkeypatch):
     runner.feedback("input_rejected", "missing effect")
+    review = Mock()
+    monkeypatch.setattr(runner, "review", review)
     act(runner, "DONE")
-    act(runner, "DONE")
-    assert runner.state["status"] == "blocked"
-    assert runner.state["stop_reason"]["code"] == "unresolved_effect"
+    review.assert_called_once_with("proposed_completion", proposed="DONE")
+    assert runner.state["recovery"] is not None
 
 
-def test_late_confirmed_field_value_can_resolve_recovery_before_done(runner):
+def test_late_confirmed_field_value_resolves_recovery_before_completion_review(runner, monkeypatch):
     runner.feedback("input_rejected", "missing effect")
     runner.state["recovery"]["effect"] = {"reason": "input_rejected", "field_node": 10, "expected": "Berlin"}
     runner.state["page"]["actions"][0]["value"] = "Berlin"
+    review = Mock()
+    monkeypatch.setattr(runner, "review", review)
     act(runner, "DONE")
-    assert runner.state["status"] == "done"
+    review.assert_called_once_with("proposed_completion", proposed="DONE")
     assert runner.state["recovery"] is None
 
 

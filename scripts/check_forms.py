@@ -153,6 +153,70 @@ def main():
         page = browser.observe(screenshot=False)
         assert not any(a["kind"] == "fill" for a in page["actions"])
         passed.append("covered fields are not offered for text generation or input")
+
+        # A small ARIA modal can leave background controls physically uncovered.
+        # The dialog, rather than simple hit-testing, must constrain those controls.
+        markup = '''<!doctype html><title>Modal fixture</title>
+        <style>body{min-height:2500px}.popup{position:fixed;left:360px;top:180px;
+        width:380px;padding:25px;background:white;border:2px solid;z-index:100}</style>
+        <button id="background" onclick="window.backgroundClicks++">Background action</button>
+        <script>window.backgroundClicks=0</script>'''
+        browser.evaluate("document.open();document.write(" + json.dumps(markup) + ");document.close();"
+                         "scrollTo({top:0,behavior:'instant'})")
+        before = browser.observe(screenshot=False)
+        background = next(a for a in before["actions"] if a["label"] == "Background action")
+        popup = '''<div class="popup" role="dialog" aria-modal="true" aria-labelledby="heading">
+          <h2 id="heading">Contact required</h2><p>Supply an email to reveal your result.</p>
+          <label>Email<input name="contact" type="email" required></label>
+          <button onclick="this.parentElement.remove()">Close</button></div>'''
+        browser.evaluate("document.body.insertAdjacentHTML('beforeend'," + json.dumps(popup) + ")")
+        assert not browser.fresh(before, background)
+        try:
+            browser.act(background, before)
+        except StalePage:
+            pass
+        else:
+            raise AssertionError("A new modal did not invalidate the background decision")
+        assert browser.evaluate("window.backgroundClicks") == 0
+        passed.append("new modal invalidates an old background action without executing it")
+
+        page = browser.observe(screenshot=False)
+        dialog = page["active_dialog"]
+        assert dialog["modal"] and dialog["label"] == "Contact required", dialog
+        assert dialog["required_fields"][0]["context"]["type"] == "email"
+        assert "Supply an email" in dialog["text"]
+        assert not any(a["label"] == "Background action" or a["kind"] == "scroll" for a in page["actions"])
+        assert all(a.get("dialog_node") == dialog["node"] for a in page["actions"] if a.get("node"))
+        passed.append("active modal separates required contact evidence and excludes background targets/scrolls")
+
+        close = next(a for a in page["actions"] if a["label"] == "Close")
+        browser.act(close, page)
+        page = browser.observe(screenshot=False)
+        assert page["active_dialog"] is None
+        assert any(a["label"] == "Background action" for a in page["actions"])
+        passed.append("observed dismissal restores background controls on the next observation")
+
+        # The popup itself has no ARIA semantics: annotate a candidate, do not invent modal authority.
+        overlay = '''<div class="popup" style="top:250px;height:250px">
+          <h2>Optional panel</h2><input aria-label="Panel input"><button>Continue</button></div>'''
+        browser.evaluate("document.body.insertAdjacentHTML('beforeend'," + json.dumps(overlay) + ")")
+        page = browser.observe(screenshot=False)
+        assert page["active_dialog"]["kind"] == "overlay_candidate", page["dialogs"]
+        assert not page["active_dialog"]["modal"]
+        assert any(a["label"] == "Background action" for a in page["actions"])
+        passed.append("unlabelled overlay receives context without inventing modal semantics")
+
+        browser.evaluate("document.querySelector('.popup').remove()")
+        portal = '''<div class="popup" role="dialog" aria-modal="true">
+          <input aria-label="City" role="combobox" aria-controls="portal" aria-expanded="true"></div>
+          <div id="portal" role="listbox" style="position:fixed;top:100px;left:500px;z-index:200">
+          <div role="option">Observed city</div></div>'''
+        browser.evaluate("document.body.insertAdjacentHTML('beforeend'," + json.dumps(portal) + ")")
+        page = browser.observe(screenshot=False)
+        field = next(a for a in page["actions"] if a["kind"] == "fill")
+        option = next(a for a in page["actions"] if a.get("role") == "option")
+        assert option["owner_node"] == field["node"]
+        passed.append("explicitly owned portal suggestions remain actionable outside the modal subtree")
     finally:
         browser.close()
     print("\n".join(passed))

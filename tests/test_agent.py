@@ -10,6 +10,7 @@ import pytest
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
 from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.supervision import initial_task, semantic_key
 
 
 def page():
@@ -82,6 +83,7 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
         return {
             "model": "test",
             "answers": {
+                "review_gate": choice(["CONTINUE", "REVIEW"], "CONTINUE"),
                 "operation": choice(body["questions"]["operation"]["criteria"], "TYPE_TEXT"),
                 "type_text_target": choice(["1"], "1"),
                 "click_target": {"choice": "invented"},
@@ -93,7 +95,9 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
-    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+    assert set(calls[0]["questions"]) == {
+        "operation", "click_target", "type_text_target", "review_gate", "review_reason",
+    }
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
@@ -101,6 +105,7 @@ def test_click_cannot_consume_a_text_target(monkeypatch):
         return {
             "model": "test",
             "answers": {
+                "review_gate": choice(["CONTINUE", "REVIEW"], "CONTINUE"),
                 "operation": choice(body["questions"]["operation"]["criteria"], "CLICK"),
                 "type_text_target": choice(["1"], "1"),
                 "click_target": choice(["1", "2", "999"], "999"),
@@ -129,6 +134,7 @@ def test_target_head_receives_control_state_and_full_next_step_rules(monkeypatch
         return {
             "model": "test",
             "answers": {
+                "review_gate": choice(["CONTINUE", "REVIEW"], "CONTINUE"),
                 "operation": choice(questions["operation"]["criteria"], "CLICK"),
                 "click_target": choice(target["criteria"], "3"),
             },
@@ -174,6 +180,15 @@ def runner():
         "started_at": time.perf_counter(),
         "record": False,
         "text_calls": [],
+        "events": [],
+        "task_state": initial_task("Find a book"),
+        "supervisor_calls": [{"trigger": "initialize", "output": {}}],
+        "observations": [],
+        "review_visits": {},
+        "review_pending": None,
+        "progress": {"review_decision": 0, "review_step": 0, "review_state": 0,
+                     "states": [semantic_key(p, viewport=True)]},
+        "outcome": {"assessment": "incomplete", "independently_verified": False},
     }
     return a
 

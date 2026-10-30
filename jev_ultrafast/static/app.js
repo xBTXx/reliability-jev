@@ -40,7 +40,7 @@ function controls() {
   $("auto").disabled = busy || !live;
   $("auto").hidden = automatic;
   $("stop").hidden = !automatic;
-  $("download").disabled = !state?.history?.length;
+  $("download").disabled = !state?.page;
 }
 async function perform(fn, label) {
   if (busy) return;
@@ -99,7 +99,7 @@ function render() {
   $("action-count").textContent = `${state.elements.length} elements`;
   const chosen = page.actions.find((a) => a.id === d?.choice);
   $("choice-title").textContent = d
-    ? chosen?.label || d.choice
+    ? d.review_gate === "REVIEW" ? `Review: ${d.review_reason.toLowerCase().replaceAll("_", " ")}` : chosen?.label || d.choice
     : "Choose an action";
   $("latency").textContent = d ? `${d.latency_ms} ms` : "—";
   $("confidence").textContent = d?.target_confidence != null ? percent(d.target_confidence) : "—";
@@ -132,10 +132,12 @@ function render() {
         )
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';
-  $("step-count").textContent = `${state.history.length} actions · ${(state.elapsed_ms / 1000).toFixed(2)} s`;
+  $("step-count").textContent = `${state.history.length} actions · ${state.supervisor_calls?.length || 0} reviews · ${(state.elapsed_ms / 1000).toFixed(2)} s`;
   $("model-state").textContent = JSON.stringify(
     d?.request || {
       goal: state.goal,
+      task_state: state.task_state,
+      latest_review: state.supervisor_calls?.at(-1)?.output,
       url: page.url,
       text: page.text,
       actions: page.actions.map(({ rect, node, ...rest }) => rest),
@@ -170,10 +172,12 @@ $("auto").addEventListener("click", () =>
   perform(async () => {
     automatic = true;
     controls();
-    for (let i = 0; i < state.max_steps * 2 && automatic; i++) {
+    for (let i = 0; i < state.max_steps * 3 && automatic; i++) {
       $("status").textContent = "Running…";
       if ($("pace").checked) {
         await call("predict");
+        if (["done", "blocked"].includes(state.status)) break;
+        if (!state.decision) continue;
         await new Promise(resolve => setTimeout(resolve, 450));
         if (!automatic) break;
         await call("act", {fingerprint: state.page.fingerprint});

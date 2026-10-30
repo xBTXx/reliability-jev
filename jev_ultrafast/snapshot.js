@@ -56,7 +56,7 @@
     }
     return clip(texts.join(' '));
   };
-  const formOf = e => e.form || e.closest('form,[role="form"],[role="dialog"],[role="group"],fieldset');
+  const formOf = e => e.form || e.closest('form,[role="form"],dialog,[role="dialog"],[role="group"],fieldset');
   const context = e => {
     if (!safe(e)) return null;
     const form=formOf(e), group=e.closest('fieldset,[role="group"]');
@@ -78,7 +78,37 @@
     return visible(e) && r.width>0 && r.height>0 && r.bottom>0 && r.top<innerHeight &&
       r.right>0 && r.left<innerWidth;
   };
-  const comboboxes = () => [...document.querySelectorAll('[role="combobox"]')].filter(e=>safe(e)&&onScreen(e));
+  // Explicit dialogs are authoritative. Unlabelled overlay candidates are only observation clues.
+  const dialogRoots=[...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"]')]
+    .filter(onScreen);
+  const center=document.elementFromPoint(innerWidth/2,innerHeight/2);
+  let candidate=center;
+  while (candidate && candidate!==document.body) {
+    const style=getComputedStyle(candidate), r=candidate.getBoundingClientRect();
+    if (['fixed','absolute'].includes(style.position) && Number(style.zIndex)>=10 &&
+        r.width>=200 && r.height>=150 && candidate.querySelector('input,button,textarea,select') &&
+        !dialogRoots.some(root=>root.contains(candidate)||candidate.contains(root))) {
+      dialogRoots.push(candidate); break;
+    }
+    candidate=candidate.parentElement;
+  }
+  const isModal=e=>e.getAttribute('aria-modal')==='true' || e.matches('dialog:modal');
+  const modalRoots=dialogRoots.filter(isModal);
+  const topRoot=roots=>[...roots].reverse().find(root=>{
+    const r=root.getBoundingClientRect();
+    const hit=document.elementFromPoint(Math.max(0,Math.min(innerWidth-1,r.x+r.width/2)),
+      Math.max(0,Math.min(innerHeight-1,r.y+r.height/2)));
+    return hit && root.contains(hit);
+  });
+  const activeRoot=topRoot(modalRoots) || topRoot(dialogRoots);
+  const activeModal=activeRoot && isModal(activeRoot) ? activeRoot : null;
+  // Explicitly owned portal controls may live outside an ARIA dialog's DOM subtree.
+  const inScope=e=>!activeModal || activeModal.contains(e) ||
+    [...activeModal.querySelectorAll('[aria-controls],[aria-owns]')].some(field=>
+      [...refs(field,'aria-controls'),...refs(field,'aria-owns')].some(root=>root===e||root.contains(e)));
+  const dialogFor=e=>[...dialogRoots].reverse().find(root=>root.contains(e));
+  const comboboxes = () => [...document.querySelectorAll('[role="combobox"]')]
+    .filter(e=>safe(e)&&onScreen(e)&&inScope(e));
   const owner = option => {
     const fields=comboboxes();
     const explicit=fields.filter(e=>[...refs(e,'aria-controls'),...refs(e,'aria-owns')]
@@ -94,13 +124,15 @@
       return {node:identity(active),source:'focus'};
     return null;
   };
-  const optionsFor = field => [...document.querySelectorAll('[role="option"]')].filter(onScreen)
+  const optionsFor = field => [...document.querySelectorAll('[role="option"]')].filter(e=>onScreen(e)&&inScope(e))
     .filter(o=>owner(o)?.node===identity(field));
   const optionSignature = options => options.map(o=>[identity(o),clip(o.textContent),o.getAttribute('aria-selected')]);
   cache.context=context; cache.owner=owner; cache.optionsFor=optionsFor; cache.optionSignature=optionSignature;
   cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     [...document.querySelectorAll('input,textarea,select')].filter(safe)
-      .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly])];
+      .map(e=>[identity(e),e.value,e.checked,e.selectedIndex,e.disabled,e.readOnly]),
+    [...document.querySelectorAll('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"]')]
+      .filter(onScreen).map(e=>[identity(e),isModal(e)])];
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
@@ -112,13 +144,15 @@
   };
   const actions=[];
   for (const e of document.querySelectorAll(selector)) {
-    if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
+    if (!safe(e) || !visible(e) || !inScope(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
     if (!e.contains(document.elementFromPoint(x,y))) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
       rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+    const dialog=dialogFor(e);
+    if (dialog) base.dialog_node=identity(dialog);
     const editableContext=['textbox','searchbox','spinbutton','combobox'].includes(rname);
     if (editableContext) base.context=context(e);
     const option=e.closest('[role="option"]');
@@ -156,10 +190,21 @@
     }
   }
   const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
+  const dialogs=dialogRoots.map(root=>({node:identity(root),
+    kind:root.matches('dialog,[role="dialog"],[role="alertdialog"],[aria-modal="true"]') ? 'dialog' : 'overlay_candidate',
+    label:clip(root.getAttribute('aria-label') || refs(root,'aria-labelledby').map(e=>e.textContent).join(' ') ||
+      root.querySelector('h1,h2,h3,[role="heading"]')?.textContent,200),
+    modal:isModal(root),text:readable(root),
+    controls:[...new Set(actions.filter(a=>root.contains(cache.nodes.get(a.node))).map(a=>a.node))],
+    required_fields:[...root.querySelectorAll('input,textarea,select')]
+      .filter(e=>safe(e)&&visible(e)&&(e.required||e.getAttribute('aria-required')==='true'))
+      .slice(0,12).map(e=>({node:identity(e),label:name(e),value:String(e.value||''),context:context(e)})),
+  }));
+  const active_dialog=activeRoot ? dialogs.find(d=>d.node===identity(activeRoot))||null : null;
   // Observed form hints aid scrolling, but never become executable offscreen targets.
   const fields_outside_view=[...document.querySelectorAll('input,textarea,select')].filter(e=>{
     const r=e.getBoundingClientRect();
-    return safe(e) && visible(e) && r.width>0 && r.height>0 && (r.bottom<=0 || r.top>=innerHeight);
+    return safe(e) && visible(e) && inScope(e) && r.width>0 && r.height>0 && (r.bottom<=0 || r.top>=innerHeight);
   }).slice(0,24).map(e=>({node:identity(e),label:name(e),role:role(e),value:String(e.value||''),
     context:context(e),position:e.getBoundingClientRect().bottom<=0 ? 'above' : 'below'}));
   const page_key=cache.pageKey(), guards={};
@@ -167,13 +212,15 @@
   // Compare meaning and identity. Geometry is always resolved and hit-tested just before input.
   const semantics=actions.map(({rect,...action})=>action);
   const marker=[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
-    document.title,text,semantics,page_key[6],fields_outside_view];
+    document.title,text,semantics,page_key[6],fields_outside_view,dialogs,active_dialog];
   const omitted_actions=Math.max(0,actions.length-250);
   actions.splice(250);
   actions.forEach((a,i)=>a.id='e'+(i+1));
-  if (scrollY+innerHeight<height-2) actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
-  if (scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
+  if (!activeModal && scrollY+innerHeight<height-2)
+    actions.push({id:'scroll_down',kind:'scroll',label:'Scroll down',delta:560});
+  if (!activeModal && scrollY>0) actions.push({id:'scroll_up',kind:'scroll',label:'Scroll up',delta:-560});
   actions.push({id:'wait',kind:'wait',label:'Wait for the page to update'});
   return {url:location.href,title:document.title,w:innerWidth,h:innerHeight,text,
-    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,fields_outside_view};
+    scroll:{y:scrollY,height},actions,marker,page_key,guards,omitted_actions,fields_outside_view,
+    dialogs,active_dialog};
 })()

@@ -5,17 +5,31 @@ import time
 from pathlib import Path
 
 from .browser import Browser, MutationUncertain, StalePage
-from .model import TextHelperError, action_space, choose, field_context, field_text
+from .costs import cost_summary, pricing, track_calls
+from .model import ModelProviderError, TextHelperError, action_space, choose, field_context, field_text
+from .progress import progress_scope
 from .questions import MAX_STEPS
+from .supervision import (
+    MAX_REVIEWS,
+    SupervisorError,
+    forced_review,
+    initial_task,
+    remember,
+    review_context,
+    semantic_key,
+    supervise,
+)
 
 
 class Agent:
-    def __init__(self, url, goals, *, record_dir=None, screenshots=False):
+    def __init__(self, url, goals, *, record_dir=None, screenshots=False, on_progress=None):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
+        cost_pricing = pricing()
         self.pending_text = None
+        self.on_progress = on_progress
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
         self.screenshots = screenshots or bool(record_dir)
@@ -42,7 +56,20 @@ class Agent:
             elapsed_ms=0,
             started_at=None,
             record=bool(self.record_dir),
+            task_state=initial_task(task),
+            supervisor_calls=[],
+            observations=[],
+            review_pending=None,
+            review_visits={},
+            progress={"review_decision": 0, "review_step": 0, "review_state": 0,
+                      "states": [semantic_key(page, viewport=True)]},
+            outcome={"assessment": "incomplete", "independently_verified": False},
+            question=None,
+            review_authorization=None,
+            model_calls=[],
+            cost_pricing=cost_pricing,
         )
+        remember(self.state)
         if self.record_dir:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
@@ -53,6 +80,7 @@ class Agent:
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": action_space(self.state["page"]["actions"])[0],
+            "cost_summary": cost_summary(self.state),
         }
 
     def stop(self, code, message):
@@ -66,6 +94,11 @@ class Agent:
                  "field": (action or {}).get("label"), "decision": len(state["decisions"]),
                  "elapsed_ms": round((time.perf_counter() - state["started_at"]) * 1000)}
         state.setdefault("events", []).append(event)
+        failed = state["task_state"].setdefault("failed_approaches", [])
+        approach = {k: event[k] for k in ("code", "message", "node", "field")}
+        if approach not in failed:
+            failed.append(approach)
+            del failed[:-12]
         recovery = state.get("recovery")
         if recovery is None:
             state["recovery"] = {"remaining": 2, "cause": event}
@@ -73,7 +106,75 @@ class Agent:
             recovery["remaining"] -= 1
         state["status"] = "ready"
         if state["recovery"]["remaining"] <= 0:
-            self.stop(code, f"Reassessment exhausted: {message}")
+            state["review_pending"] = "recovery_exhausted"
+
+    def review(self, trigger, proposed=None):
+        """Discard the speculative action; advice always precedes a new observation/decision."""
+        state = self.state
+        state["decision"] = None
+        state["status"] = "ready"
+        self.pending_text = None
+        state["review_authorization"] = None
+        if not state["browser"].fresh(state["page"]):
+            state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        if state.get("recovery") and self.recovery_resolved():
+            state["recovery"] = None
+        if len(state["supervisor_calls"]) >= MAX_REVIEWS:
+            self.stop("supervisor_budget", f"Stopped at the {MAX_REVIEWS}-review budget.")
+            return
+        key = semantic_key(state["page"])
+        visits = state["review_visits"]
+        visits[key] = visits.get(key, 0) + 1
+        if visits[key] > 3:
+            self.stop("review_stalled", "Repeated reviews without a changed task state; inspect the obstacle.")
+            return
+        context = review_context(state, trigger, proposed)
+        call = {"trigger": trigger, "input": context, "decision": len(state["decisions"]),
+                "after_step": len(state["history"])}
+        state["supervisor_calls"].append(call)
+        try:
+            with track_calls(state, "supervisor"):
+                output, info = supervise(context, on_update=call.update)
+        except SupervisorError as error:
+            call.update(error.info)
+            self.stop("supervisor_error", str(error))
+            return
+        call.update(info, output=output)
+        state["task_state"].update({k: output[k] for k in (
+            "objective", "requirements", "constraints", "blockers", "missing_information"
+        )})
+        state["task_state"]["revision"] += 1
+        state["plan"] = [output["objective"]]
+        state["plan_index"] = 0
+        state["review_pending"] = None
+        progress = state["progress"]
+        progress.update(review_decision=len(state["decisions"]), review_step=len(state["history"]),
+                        review_state=len(progress["states"]) - 1)
+        if state.get("recovery"):
+            state["recovery"]["remaining"] = 2  # Advice doesn't erase the unresolved effect.
+        # The supervisor never authorizes execution of its old speculative action.
+        before = state["page"]["fingerprint"]
+        state["page"] = state["browser"].observe(screenshot=self.screenshots)
+        remember(state)
+        state["status"] = "ready"
+        if state["page"]["fingerprint"] != before and output["status"] != "CONTINUE":
+            state["review_pending"] = "page_changed_during_review"
+            return
+        if state["page"]["fingerprint"] == before and output["status"] == "CONTINUE":
+            state["review_authorization"] = {
+                "fingerprint": before, "review": len(state["supervisor_calls"]),
+                "summary": output["summary"], "objective": output["objective"],
+            }
+        if output["status"] == "NEEDS_INPUT":
+            state["question"] = output["question"]
+            self.stop("needs_input", output["question"])
+        elif output["status"] == "BLOCKED":
+            self.stop("supervisor_blocked", output["summary"])
+        elif output["status"] == "COMPLETE":
+            state["outcome"]["assessment"] = "model_reported_complete"
+            state["status"] = "done"
+            state["plan_index"] = 1
+            state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
 
     @staticmethod
     def mutation_key(page, action, text):
@@ -100,11 +201,29 @@ class Agent:
         return any(a.get("owner_node") == field["node"] for a in page["actions"])
 
     def command(self, name, body=None):
+        with progress_scope(getattr(self, "on_progress", None)):
+            try:
+                return self._command(name, body)
+            except ModelProviderError as error:
+                self.state["decision"] = None
+                self.pending_text = None
+                self.state["events"].append({"code": "model_provider_error", **error.info})
+                self.stop("model_provider_error", str(error))
+                return self.snapshot()
+            except KeyboardInterrupt:
+                self.state["decision"] = None
+                self.pending_text = None
+                self.stop("interrupted", "Run interrupted; inspect the final page before starting again.")
+                raise
+
+    def _command(self, name, body=None):
         body = body or {}
         state = self.state
         if name == "tick":
             try:
                 self.command("predict", {})
+                if state["status"] != "predicted":
+                    return self.snapshot()
                 return self.command("act", {"fingerprint": state["page"]["fingerprint"]})
             except StalePage:
                 if state["status"] == "blocked" and state.get("stop_reason"):
@@ -131,7 +250,17 @@ class Agent:
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 self.stop("decision_budget", "Reached the model-decision budget.")
                 return self.snapshot()
-            state["decision"] = choose(state["page"], state["goal"], state["history"], state.get("events"))
+            remember(state)
+            trigger = forced_review(state)
+            if trigger:
+                self.review(trigger)
+                return self.snapshot()
+            authorization = state.pop("review_authorization", None)
+            if authorization and authorization["fingerprint"] != state["page"]["fingerprint"]:
+                authorization = None
+            with track_calls(state, "jev"):
+                state["decision"] = choose(state["page"], state["goal"], state["history"], state.get("events"),
+                                           state["task_state"], review_authorization=authorization)
             state["decisions"].append(
                 {
                     **state["decision"],
@@ -150,6 +279,9 @@ class Agent:
             state["decision"] = None
             recovering = state.get("recovery") is not None
             selected = decision["choice"]
+            if decision.get("review_gate") == "REVIEW":
+                self.review("gate:" + decision["review_reason"])
+                return self.snapshot()
             if selected in {"DONE", "BLOCKED"}:
                 if not state["browser"].fresh(page):
                     state["status"] = "ready"
@@ -157,15 +289,7 @@ class Agent:
                 if recovering and self.recovery_resolved():
                     state["recovery"] = None
                     recovering = False
-                if selected == "DONE" and recovering:
-                    self.feedback("unresolved_effect", "Completion is unconfirmed after an unresolved action.",
-                                  consume=True)
-                    return self.snapshot()
-                state["status"] = "done" if selected == "DONE" else "blocked"
-                if selected == "BLOCKED":
-                    self.stop("policy_blocked", "The policy found no supported next action.")
-                state["plan_index"] = int(selected == "DONE")
-                state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
+                self.review("proposed_completion" if selected == "DONE" else "policy_blocked", proposed=selected)
                 return self.snapshot()
             action = next(a for a in page["actions"] if a["id"] == selected)
             if len(state["history"]) >= MAX_STEPS:
@@ -175,17 +299,20 @@ class Agent:
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
-                context = field_context(state["goal"], action, page, state["history"])
+                context = field_context(state["goal"], action, page, state["history"], state["task_state"])
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
                 else:
                     self.pending_text = None
                     try:
-                        text, helper = field_text(context)
+                        with track_calls(state, "text_helper"):
+                            text, helper = field_text(context)
                     except TextHelperError as error:
                         state["text_calls"].append({**error.info, "field": action["label"],
                                                     "value": None, "input": context})
                         self.feedback("text_helper_rejected", str(error), action, consume=recovering)
+                        if error.info.get("code") == "missing_field_value":
+                            state["review_pending"] = "missing_field_value"
                         return self.snapshot()
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text, "input": context})
@@ -260,9 +387,19 @@ class Agent:
                     base64.b64decode(state["page"]["screenshot"])
                 )
             effect = state["history"][-1]["effect"]
+            state["progress"]["states"].append(semantic_key(state["page"], viewport=True))
+            remember(state)
             state["status"] = "ready"
-            if effect["status"] == "confirmed":
+            if effect["status"] == "confirmed" and action["kind"] != "scroll":
                 state["recovery"] = None
+            elif effect["status"] == "confirmed":
+                # A settled scroll is physical movement, not resolution of a failed form action.
+                if recovering:
+                    if self.recovery_resolved():
+                        state["recovery"] = None
+                    else:
+                        self.feedback("reassessment_pending", "The earlier field effect remains unconfirmed.",
+                                      action, consume=True)
             elif effect["status"] == "unknown":
                 self.stop("execution_uncertain", "Input executed but its field effect could not be confirmed.")
             elif effect["status"] == "failed":

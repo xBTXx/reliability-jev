@@ -1,38 +1,123 @@
-"""TypeSafe makes choices; an optional small OpenAI-compatible model writes field values."""
+"""TypeSafe chooses operations, targets and reviews; a text model writes field values."""
 
 import json
 import math
 import os
+import re
 import time
 from copy import deepcopy
 
 import httpx
 
-from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
+from .costs import record_call
+from .progress import report_progress, request_progress
+from .questions import NEXT_ACTION, REVIEW_GATE, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+
+
+class ModelProviderError(RuntimeError):
+    """A provider rejection with bounded, redacted diagnostics, never raw request headers."""
+
+    def __init__(self, status, details):
+        self.info = {"http_status": status, "provider_error": details}
+        message = details.get("message", "No provider explanation was returned.")
+        prefix = f"Model provider returned HTTP {status}" if status is not None else "Model request failed"
+        super().__init__(f"{prefix}: {message}; no action executed.")
+
+
+def provider_error(result, key):
+    def clean(value):
+        value = str(value).replace(key, "[redacted]") if key else str(value)
+        value = re.sub(r"(?i)Bearer\s+\S+|\bsk-[\w-]+", "[redacted]", value)
+        return value[:800]
+
+    error = result.get("error", {}) if isinstance(result, dict) else {}
+    error = error if isinstance(error, dict) else {"message": error}
+    details = {k: clean(error[k]) for k in ("message", "code", "type", "param") if k in error}
+    metadata = error.get("metadata")
+    if isinstance(metadata, dict):
+        if metadata.get("provider_name"):
+            details["provider"] = clean(metadata["provider_name"])
+        raw = metadata.get("raw")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except ValueError:
+                raw = None  # Do not copy arbitrary raw bodies into diagnostics.
+        if isinstance(raw, dict):
+            upstream = raw.get("error", raw)
+            if isinstance(upstream, dict) and upstream.get("message"):
+                details["upstream_message"] = clean(upstream["message"])
+                details["message"] = details["upstream_message"]
+    return details
+
+
+def reasoning_options(base, model, requested):
+    """Keep reasoning controls explicit, with the documented always-on GPT-OSS exception."""
+    requested = requested.lower().strip()
+    modes = {"none", "default", "enabled", "minimal", "low", "medium", "high", "xhigh", "max"}
+    if requested not in modes:
+        raise ValueError(f"Unsupported reasoning mode: {requested}")
+    mandatory = model.rsplit("/", 1)[-1].split(":")[0] in {"gpt-oss-120b", "gpt-oss-20b"}
+    applied = "low" if mandatory and requested == "none" else requested
+    if applied == "default":
+        options = {}
+    elif "api.deepseek.com/" in base:
+        options = {"thinking": {"type": "disabled" if applied == "none" else "enabled"}}
+    elif "api.cerebras.ai/" in base:
+        options = {} if applied == "enabled" else {"reasoning_effort": applied}
+    else:
+        options = {"reasoning": {"enabled": applied == "enabled"}} if applied in {"none", "enabled"} else {
+            "reasoning": {"effort": applied},
+        }
+    return options, {"requested": requested, "applied": applied,
+                     "adjustment": "GPT-OSS reasoning is mandatory; using low instead of none."
+                     if applied != requested else None}
 
 
 class TextHelperError(ValueError):
     """A rejected model response, with evidence for the run's text-call log."""
 
-    def __init__(self, reason, info):
+    def __init__(self, reason, info, *, code="text_helper_rejected"):
         super().__init__(f"Text helper {reason}; nothing typed.")
-        self.info = {**info, "error": str(self)}
+        self.info = {**info, "code": code, "error": str(self)}
 
 
-def post_json(url, key, body):
+def post_json(url, key, body, *, timeout=None):
     for attempt in range(3):
+        receipt = record_call(body.get("model"), error="pending")
+        role = receipt["role"] if receipt else "model"
         try:
-            response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"})
+            options = {"timeout": timeout} if timeout is not None else {}
+            with request_progress(role=role, model=body.get("model"), attempt=attempt + 1,
+                                  timeout=timeout or 25) as activity:
+                response = CLIENT.post(url, json=body, headers={"Authorization": f"Bearer {key}"}, **options)
+                activity["status"] = f"HTTP {response.status_code}"
         except httpx.HTTPError:
-            raise RuntimeError("Model connection failed; no action executed.") from None
+            record_call(body.get("model"), error="connection_failed", record=receipt)
+            raise ModelProviderError(None, {
+                "message": "Model connection failed", "code": "connection_failed",
+            }) from None
+        except (KeyboardInterrupt, SystemExit):
+            record_call(body.get("model"), error="interrupted", record=receipt)
+            raise
+        try:
+            result = response.json()
+            invalid_json = False
+        except ValueError:
+            result, invalid_json = None, True
+        record_call(body.get("model"), result=result, http_status=response.status_code,
+                    error="http_error" if response.is_error else "invalid_json" if invalid_json else None,
+                    error_details=provider_error(result, key) if response.is_error else None, record=receipt)
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
-        return response.json()
+            raise ModelProviderError(response.status_code, provider_error(result, key))
+        if invalid_json:
+            raise RuntimeError("Model provider returned invalid JSON; no action executed.")
+        return result
     raise RuntimeError("Model unavailable")
 
 
@@ -68,7 +153,8 @@ def action_space(actions):
             index = str(len(elements) + 1)
             indices[node] = index
             element = {k: action[k] for k in (
-                "role", "value", "checked", "selected", "expanded", "context", "owner_node", "owner_source"
+                "role", "value", "checked", "selected", "expanded", "context", "owner_node", "owner_source",
+                "dialog_node"
             ) if k in action}
             element["node"] = node
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
@@ -90,7 +176,7 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history, feedback=None):
+def choose(state, goal, history, feedback=None, task_state=None, *, review_authorization=None):
     elements, targets, controls = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
@@ -101,8 +187,25 @@ def choose(state, goal, history, feedback=None):
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
     questions = {
-        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
+        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}},
+        "review_gate": {"type": "choice", "criteria": {
+            "CONTINUE": "Observed trajectory supports progress toward the current objective.",
+            "REVIEW": "The objective or approach needs reasoning-based reassessment.",
+        }, "instructions": {"goal": goal, "rules": REVIEW_GATE}},
+        "review_reason": {"type": "choice", "criteria": {
+            "ON_TRACK": "Progress is supported by observations.",
+            "OBSTACLE": "A dialog or other obstacle blocks the objective.",
+            "REPETITION": "Repeated states or actions without meaningful progress.",
+            "MISSING_INFORMATION": "A required value is absent from the goal.",
+            "UNEXPECTED_OUTCOME": "Observed effects differ from the intended result.",
+            "REFINE_OBJECTIVE": "The current objective needs refinement.",
+        }, "instructions": {"goal": goal, "rules": REVIEW_GATE}},
     }
+    if review_authorization:
+        # The supervisor has already reviewed this exact page. Give its guidance one fresh attempt.
+        questions["review_gate"]["criteria"] = {
+            "CONTINUE": "The supervisor approved this exact observation. Try its guidance once with observed controls.",
+        }
     for operation, candidates in targets.items():
         questions[operation.lower() + "_target"] = {
             "type": "choice",
@@ -122,6 +225,10 @@ def choose(state, goal, history, feedback=None):
             "page": {k: state[k] for k in ("url", "title", "text")},
             "scroll": state["scroll"],
             "fields_outside_view": state.get("fields_outside_view", []),
+            "dialogs": state.get("dialogs", []),
+            "active_dialog": state.get("active_dialog"),
+            "task_state": deepcopy(task_state),
+            "review_authorization": review_authorization,
             "elements": elements,
             "recent_actions": [
                 {k: h.get(k) for k in ("action", "kind", "node", "text", "page_changed", "effect")}
@@ -133,24 +240,32 @@ def choose(state, goal, history, feedback=None):
     }
     started = time.perf_counter()
     result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    gate = validate_choice(result["answers"].get("review_gate", {}), questions["review_gate"]["criteria"])
+    reason = None
+    if gate["choice"] == "REVIEW":
+        reason = validate_choice(result["answers"].get("review_reason", {}), questions["review_reason"]["criteria"])
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
     target_answer = None
     probabilities = {}
-    if operation in targets:
+    if operation in targets and gate["choice"] == "CONTINUE":
         # Unused target heads cannot cause an action. Validate the head selected by the operation.
         target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
         target = target_answer["choice"]
         choice = targets[operation][target]["id"]
         probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
-    else:
+    elif operation not in targets:
         choice = controls[operation]["id"] if operation in controls else operation
         probabilities[choice] = operation_answer["probabilities"][operation]
+    else:
+        choice = None  # All speculative targets are discarded when reassessment is selected.
     return {
         "choice": choice,
         "operation": operation,
         "target": target,
+        "review_gate": gate["choice"],
+        "review_reason": reason["choice"] if reason else None,
         "confidence": operation_answer["confidence"],
         "probabilities": probabilities,
         "operation_probabilities": operation_answer["probabilities"],
@@ -164,7 +279,7 @@ def choose(state, goal, history, feedback=None):
     }
 
 
-def field_context(goal, action, page, history):
+def field_context(goal, action, page, history, task_state=None):
     elements = action_space(page["actions"])[0]
     field = next(e for e in elements if e["node"] == action["node"])
     form = action.get("context", {}).get("form")
@@ -179,6 +294,8 @@ def field_context(goal, action, page, history):
         "form_fields": related,
         "page": {"url": page["url"], "title": page["title"], "text": page["text"][:6000]},
         "recent_actions": [{k: h.get(k) for k in ("action", "node", "text", "effect")} for h in history[-6:]],
+        "task_state": task_state,
+        "active_dialog": page.get("active_dialog"),
     })
 
 
@@ -188,9 +305,16 @@ def field_text(context):
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     model = os.environ.get("TEXT_MODEL", "deepseek-chat")
-    reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
-    if os.environ.get("TEXT_MODEL_REASONING") == "none":
-        reasoning = {"reasoning": {"enabled": False}}
+    requested = os.environ.get("TEXT_MODEL_REASONING", "none" if "api.deepseek.com/" in base else "low")
+    reasoning, reasoning_info = reasoning_options(base, model, requested)
+    if reasoning_info["adjustment"]:
+        report_progress(role="text_helper", phase="configuration", message=reasoning_info["adjustment"])
+    try:
+        budget = int(os.environ.get("TEXT_MODEL_MAX_TOKENS", "2048" if reasoning_info["applied"] != "none" else "1024"))
+        if not 256 <= budget <= 32768:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("TEXT_MODEL_MAX_TOKENS must be between 256 and 32768") from None
     routing = {}
     if provider := os.environ.get("TEXT_MODEL_PROVIDER", "").strip():
         if "openrouter.ai/" not in base:
@@ -202,7 +326,7 @@ def field_text(context):
         key,
         {
             "model": model,
-            "max_tokens": 1024,
+            "max_tokens": budget,
             "response_format": {"type": "json_object"},
             **reasoning,
             **routing,
@@ -220,6 +344,7 @@ def field_text(context):
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "usage": result.get("usage", {}),
         "provider": result.get("provider"),
+        "reasoning": reasoning_info,
     }
     try:
         choice = result["choices"][0]
@@ -228,8 +353,8 @@ def field_text(context):
     except (KeyError, IndexError, TypeError, AttributeError):
         raise TextHelperError("response is missing a completion message", info) from None
 
-    def reject(reason):
-        raise TextHelperError(reason, {**info, "response_content": content})
+    def reject(reason, **kwargs):
+        raise TextHelperError(reason, {**info, "response_content": content}, **kwargs)
 
     if info["finish_reason"] == "length":
         reject("hit the output token limit before finishing")
@@ -241,7 +366,7 @@ def field_text(context):
         reject('must return exactly {"text": "value"}')
     value = output["text"]
     if value is None:
-        reject("could not infer a value for the selected field from the task")
+        reject("could not infer a value for the selected field from the task", code="missing_field_value")
     if not isinstance(value, str) or not value.strip() or len(value) > 2000:
         reject("returned an empty, non-string, or oversized field value")
     return value, info

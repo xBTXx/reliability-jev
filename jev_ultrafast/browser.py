@@ -129,7 +129,7 @@ class Browser:
 
 
 def fingerprint(state):
-    content = {k: state[k] for k in ("url", "text", "actions", "scroll")}
+    content = {k: state.get(k) for k in ("url", "text", "actions", "scroll", "dialogs", "active_dialog")}
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 

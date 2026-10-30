@@ -1,0 +1,45 @@
+{
+  "goal": "Calculate price from Milan to Milan?",
+  "requirements": [
+    {
+      "id": "r1",
+      "text": "Calculate a transport price from Milan to Berlin for one pallet",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "r2",
+      "text": "Use pallet dimensions 120 x 120? cm",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "r3",
+      "text": "Use shipment weight 200 kg",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "r4",
+      "text": "Use pickup availability starting tomorrow (2026-10-31)",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "r5",
+      "text": "Provide the visible calculated price without booking or purchasing transport",
+      "status": "pending",
+      "evidence": []
+    }
+  ],
+  "constraints": [
+    "Use the online price calculator; do not make a booking or commitment",
+    "Use Milan as origin and Milan? as destination only within the stated shipment scope",
+    "Preserve the pallet quantity, dimensions, weight, and availability date from the request"
+  ],
+  "blocked": [],
+  "failed_approaches": [],
+  "missing_information": [],
+  "question": null,
+  "next_action": "Enter Milan as the pickup location and Milan? as the destination in the online quote form."
+}
