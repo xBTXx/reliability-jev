@@ -4,12 +4,21 @@ import json
 import math
 import os
 import time
+from copy import deepcopy
 
 import httpx
 
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
+
+
+class TextHelperError(ValueError):
+    """A rejected model response, with evidence for the run's text-call log."""
+
+    def __init__(self, reason, info):
+        super().__init__(f"Text helper {reason}; nothing typed.")
+        self.info = {**info, "error": str(self)}
 
 
 def post_json(url, key, body):
@@ -58,7 +67,10 @@ def action_space(actions):
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            element = {k: action[k] for k in ("role", "value", "checked", "selected", "expanded") if k in action}
+            element = {k: action[k] for k in (
+                "role", "value", "checked", "selected", "expanded", "context", "owner_node", "owner_source"
+            ) if k in action}
+            element["node"] = node
             element.update(index=index, label=action["label"].split(" → ")[0], operations=[])
             if kind == "select":
                 element["value"] = action.get("current_value", "")
@@ -78,7 +90,7 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history):
+def choose(state, goal, history, feedback=None):
     elements, targets, controls = action_space(state["actions"])
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
@@ -98,7 +110,7 @@ def choose(state, goal, history):
                 index: {
                     "element": f"[{index}] {a['label']}",
                     "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+                    **{k: a[k] for k in ("role", "checked", "selected", "expanded", "context", "owner_node") if k in a},
                 }
                 for index, a in candidates.items()
             },
@@ -108,10 +120,14 @@ def choose(state, goal, history):
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
             "page": {k: state[k] for k in ("url", "title", "text")},
+            "scroll": state["scroll"],
+            "fields_outside_view": state.get("fields_outside_view", []),
             "elements": elements,
             "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed")} for h in history[-10:]
+                {k: h.get(k) for k in ("action", "kind", "node", "text", "page_changed", "effect")}
+                for h in history[-10:]
             ],
+            "recent_feedback": (feedback or [])[-6:],
         },
         "questions": questions,
     }
@@ -149,12 +165,21 @@ def choose(state, goal, history):
 
 
 def field_context(goal, action, page, history):
-    return {
+    elements = action_space(page["actions"])[0]
+    field = next(e for e in elements if e["node"] == action["node"])
+    form = action.get("context", {}).get("form")
+    related = [e for e in elements if "TYPE_TEXT" in e["operations"] and
+               (form is None or e.get("context", {}).get("form") == form)][:24]
+    related += [e for e in page.get("fields_outside_view", []) if
+                form is None or e.get("context", {}).get("form") == form][:24-len(related)]
+    return deepcopy({
         "goal": goal,
-        "field": {k: action.get(k) for k in ("label", "role", "value")},
-        "page": {"title": page["title"], "text": page["text"][:6000]},
-        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
-    }
+        "field": field,
+        "document": page.get("marker", [page["url"]])[0],
+        "form_fields": related,
+        "page": {"url": page["url"], "title": page["title"], "text": page["text"][:6000]},
+        "recent_actions": [{k: h.get(k) for k in ("action", "node", "text", "effect")} for h in history[-6:]],
+    })
 
 
 def field_text(context):
@@ -166,6 +191,11 @@ def field_text(context):
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    routing = {}
+    if provider := os.environ.get("TEXT_MODEL_PROVIDER", "").strip():
+        if "openrouter.ai/" not in base:
+            raise ValueError("TEXT_MODEL_PROVIDER requires an OpenRouter TEXT_MODEL_BASE_URL.")
+        routing = {"provider": {"order": [provider], "allow_fallbacks": False, "require_parameters": True}}
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
@@ -175,6 +205,7 @@ def field_text(context):
             "max_tokens": 1024,
             "response_format": {"type": "json_object"},
             **reasoning,
+            **routing,
             "messages": [
                 {"role": "system", "content": TEXT_VALUE},
                 {
@@ -184,15 +215,33 @@ def field_text(context):
             ],
         },
     )
-    try:
-        output = json.loads(result["choices"][0]["message"]["content"])
-        value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
-            raise ValueError()
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("Text helper returned no valid field value; nothing typed.") from None
-    return value, {
+    info = {
         "model": model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
         "usage": result.get("usage", {}),
+        "provider": result.get("provider"),
     }
+    try:
+        choice = result["choices"][0]
+        content = choice["message"]["content"]
+        info["finish_reason"] = choice.get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        raise TextHelperError("response is missing a completion message", info) from None
+
+    def reject(reason):
+        raise TextHelperError(reason, {**info, "response_content": content})
+
+    if info["finish_reason"] == "length":
+        reject("hit the output token limit before finishing")
+    try:
+        output = json.loads(content)
+    except (ValueError, TypeError):
+        reject("returned invalid JSON (see text_calls in the saved trace)")
+    if not isinstance(output, dict) or set(output) != {"text"}:
+        reject('must return exactly {"text": "value"}')
+    value = output["text"]
+    if value is None:
+        reject("could not infer a value for the selected field from the task")
+    if not isinstance(value, str) or not value.strip() or len(value) > 2000:
+        reject("returned an empty, non-string, or oversized field value")
+    return value, info

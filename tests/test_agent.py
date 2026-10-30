@@ -221,8 +221,9 @@ def test_loading_waits_do_not_trigger_no_progress_stop(runner):
 def test_stale_observation_preserves_executed_action(runner):
     runner.state["decision"] = decision("e3")
     runner.state["browser"].observe.side_effect = StalePage("changed")
-    with pytest.raises(StalePage):
-        runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["status"] == "blocked"
+    assert runner.state["stop_reason"]["code"] == "execution_uncertain"
     assert runner.state["history"][-1]["action"] == "Go"
     runner.state["browser"].act.assert_called_once()
 
@@ -310,6 +311,52 @@ def test_text_helper_rejects_invalid_values(monkeypatch, content):
     monkeypatch.setattr(model, "post_json", Mock(return_value={"choices": [{"message": {"content": content}}]}))
     with pytest.raises(ValueError, match="nothing typed"):
         model.field_text({"goal": "Find a flight"})
+
+
+def test_text_helper_provider_pin_and_failure_evidence(monkeypatch):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("TEXT_MODEL_PROVIDER", "together")
+    post = Mock(return_value={
+        "provider": "Together", "usage": {"completion_tokens": 5},
+        "choices": [{"finish_reason": "stop", "message": {"content": '{"text":null}'}}],
+    })
+    monkeypatch.setattr(model, "post_json", post)
+    with pytest.raises(model.TextHelperError, match="could not infer") as failure:
+        model.field_text({"goal": "Find a flight"})
+    assert post.call_args.args[2]["provider"] == {
+        "order": ["together"], "allow_fallbacks": False, "require_parameters": True,
+    }
+    assert failure.value.info["response_content"] == '{"text":null}'
+    assert failure.value.info["usage"] == {"completion_tokens": 5}
+    assert post.call_count == 1
+
+
+@pytest.mark.parametrize("response,reason", [
+    ({"choices": []}, "missing a completion"),
+    ({"choices": [{"message": {"content": '[]'}}]}, "exactly"),
+    ({"choices": [{"message": {"content": 'not json'}}]}, "invalid JSON"),
+    ({"choices": [{"finish_reason": "length", "message": {"content": '{"text":"x"}'}}]}, "token limit"),
+])
+def test_text_helper_reports_response_failure(monkeypatch, response, reason):
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    monkeypatch.setattr(model, "post_json", Mock(return_value=response))
+    with pytest.raises(model.TextHelperError, match=reason):
+        model.field_text({"goal": "Find a flight"})
+
+
+def test_rejected_text_call_is_recorded_without_browser_mutation(runner, monkeypatch):
+    error = model.TextHelperError("returned invalid JSON", {"model": "test", "usage": {}})
+    helper = Mock(side_effect=error)
+    monkeypatch.setattr(loop, "field_text", helper)
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert runner.state["text_calls"][0]["error"] == str(error)
+    assert runner.state["text_calls"][0]["input"]["field"]["node"] == 10
+    assert runner.state["recovery"]["remaining"] == 2
+    assert runner.pending_text is None
+    assert runner.state["decision"] is None
+    runner.state["browser"].act.assert_not_called()
+    assert helper.call_count == 1
 
 
 def test_navigation_during_prediction_reobserves_without_action(runner):

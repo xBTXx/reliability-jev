@@ -86,7 +86,7 @@ function render() {
     done: "Jev reports complete · inspect the page",
     blocked: "Stopped · no supported next action",
   };
-  $("status").textContent = labels[state.status] || state.status;
+  $("status").textContent = state.stop_reason?.message || labels[state.status] || state.status;
   if (!page) {
     controls();
     return;
@@ -128,7 +128,7 @@ function render() {
     ? state.history
         .map(
           (h) =>
-            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.latency_ms} ms · ${percent(h.probability)}</span><span class="effect">${h.page_changed ? "Page changed" : "No change observed"}</span></div>`,
+            `<div class="trace-row"><span class="number">${String(h.step).padStart(2, "0")}</span><div>${escape(h.action)}${h.text ? ` <b>“${escape(h.text)}”</b><small>${escape(h.text_helper)}</small>` : ""}</div><span class="time">${h.latency_ms} ms · ${percent(h.probability)}</span><span class="effect">${escape(h.effect && h.effect.status !== "not_applicable" ? `${h.effect.status}: ${h.effect.reason}` : h.page_changed ? "Page changed" : "No change observed")}</span></div>`,
         )
         .join("")
     : '<p class="muted">Each executed action leaves an observed result.</p>';

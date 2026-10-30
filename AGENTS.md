@@ -2,6 +2,10 @@
 
 Read README.md before editing. Keep the loop small: page -> indexed elements -> operation + target -> execution.
 
+Read [docs/reliability-development.md](docs/reliability-development.md) for the reliability goal,
+first milestone, local changes, Windows runtime setup, and development procedure. Keep that guide
+current when project behavior or milestone status changes.
+
 - The input is one natural-language goal. Do not add site-specific plans or hardcoded field values.
 - TypeSafe chooses an operation and operation-specific target heads in one request. Consume only the selected operation's target.
 - Targets must map to observed elements and supported operations. Never let the model emit selectors or executable code.
